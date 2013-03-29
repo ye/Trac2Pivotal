@@ -134,7 +134,11 @@ def translate_time(time):
 
     >>> translate_time(100000)
     u'"Jan 02, 1970"'
+    >>> datetime.fromtimestamp(9999999999)
+    datetime.datetime(2286, 11, 20, 12, 46, 39)
     """
+    if time > 9999999999:
+        time = time / 1000000
     date = datetime.fromtimestamp(time)
     return clean_text(date.strftime(u"%b %d, %Y").encode("ascii"))
 

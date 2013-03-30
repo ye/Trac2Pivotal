@@ -2,7 +2,12 @@
 import sys
 import os
 import sqlite3
+import requests
+import argparse
 from datetime import datetime
+from datatree import Tree
+from xml.dom import minidom
+
 
 # translation from ticket state and resolution to story state
 # add your customized trac states/resolutions here
@@ -41,6 +46,7 @@ TYPES = {
     u"task": u"feature"
 }
 
+PT_ENDPOINT = 'https://www.pivotaltracker.com/services/v3/projects/{PROJECT_ID}'
 
 def format_story(ticket):
     """ adds some information to the story.
@@ -90,7 +96,7 @@ def getargs():
 re_bold = re.compile(r"'''(.+?)'''")
 re_italic = re.compile(r"''(.+?)''")
 
-def clean_text(text):
+def clean_text(text, quotes=True):
     """ cleans up text
     >>> x = u'F\xfcr ben\xf6tigt k\xf6nnte.\\r\\n\\r\\nTest'
     >>> clean_text(x)
@@ -100,7 +106,10 @@ def clean_text(text):
         text = re_bold.sub(r"*\1*", text)
         text = re_italic.sub(r"_\1_", text)
         text = text.replace(u'"', u"'")
-        text = u'"' + text + u'"'
+        if quotes:
+            text = u'"' + text + u'"'
+        else:
+            text = unicode(text)
     return text
 
 
@@ -129,7 +138,7 @@ def translate_state(state, resolution):
     return STATES.get(state, {}).get(resolution, (u"unscheduled", ""))
 
 
-def translate_time(time):
+def translate_time(time, quotes=True):
     """ converts timestamp (int) to text
 
     >>> translate_time(100000)
@@ -140,7 +149,7 @@ def translate_time(time):
     if time > 9999999999:
         time = time / 1000000
     date = datetime.fromtimestamp(time)
-    return clean_text(date.strftime(u"%b %d, %Y").encode("ascii"))
+    return clean_text(date.strftime(u"%b %d, %Y").encode("ascii"), quotes=quotes)
 
 
 def translate_type(typ):
@@ -158,7 +167,7 @@ def translate_type(typ):
     return TYPES.get(typ, u"feature")
 
 
-def translate_tags(ticket):
+def translate_tags(ticket, quotes=True):
     """ converts tags and component to label
 
     >>> translate_tags(["0", "1", "2", "3", "A, B, C", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "D"])
@@ -176,10 +185,10 @@ def translate_tags(ticket):
             10,     # version
             11,     # milestone
     ]
-    return clean_text(u", ".join([ticket[x] for x in keys if ticket[x]]))
+    return clean_text(u", ".join([ticket[x] for x in keys if ticket[x]]), quotes=quotes)
 
 
-def read_database(db):
+def read_database(db, quotes=True):
     tickets = db.execute("select * from ticket", [])
     # Pivotal:
     # Id,Story,Labels,Story Type,Estimate,Current State,Created at,Accepted at,Deadline,Requested By,Owned By,Description,Note,Note
@@ -204,7 +213,7 @@ def read_database(db):
     # 14  summary text,
     # 15  description text,
     # 16  keywords text
-    for ticket in tickets.fetchall():
+    for ticket in tickets.fetchall()[3:]:
         # CREATE TABLE ticket_change (
         #  0  ticket integer,
         #  1  time integer,
@@ -212,22 +221,24 @@ def read_database(db):
         #  3  field text,
         #  4  oldvalue text,
         #  5  newvalue text,
-        note_query = 'select newvalue from ticket_change where field=="comment" and ticket==? and newvalue != ""'
-        notes = [clean_text(note[0]) for note in db.execute(note_query, [ticket[0]]).fetchall()]
+        note_query = 'select newvalue, time, author from ticket_change where field=="comment" and ticket==? and newvalue != ""'
+        notes_full = [note for note in db.execute(note_query, [ticket[0]]).fetchall()]
+        notes = [clean_text(note[0], quotes=quotes) for note in notes_full]
 
         result = {}
         result["Id"] = ticket[0]
-        result["Story"] = clean_text(format_story(ticket))
-        result["Labels"] = translate_tags(ticket)
+        result["Story"] = clean_text(format_story(ticket), quotes=quotes)
+        result["Labels"] = translate_tags(ticket, quotes=quotes)
         result["Story Type"] = translate_type(ticket[1])
         result["Current State"], result["Estimate"] = translate_state(ticket[12], ticket[13])
-        result["Created at"] = translate_time(ticket[2])
+        result["Created at"] = translate_time(ticket[2], quotes=quotes)
         result["Accepted at"] = translate_time(ticket[3])
         result["Deadline"] = u""
         result["Requested By"] = translate_user(ticket[8])
         result["Owned By"] = translate_user(ticket[7])
-        result["Description"] = clean_text(ticket[15])
+        result["Description"] = clean_text(ticket[15], quotes=quotes)
         result["Notes"] = ",".join(notes)    # Note1, Note2, ...
+        result["Notes Full"] = notes_full
 
         yield result
 
@@ -281,18 +292,71 @@ def write_csv(source, target):
         else:
             writer.write(csv_line.encode("utf-8"))
 
+        writer.close()
 
 
-    writer.close()
+def translate_story(entry, project_id, requestor_id):
+    tree = Tree()
+    # tree.instruct("xml", version="1.0", encoding="UTF-8") # Not supported by datatree 0.2.0 :(
+    with tree.story() as story:
+        story.project_id(project_id, type="integer")
+        story.story_type(entry["Story Type"])
+        story.current_state(entry["Current State"])
+        story.description(entry["Description"])
+        story.name(entry["Story"])
+        if requestor_id:
+            story.requested_by(requestor_id)  # not using entry["Requested By"] to prevent invalid membership error at PT end
+        story.created_at(entry["Created at"], type="datetime")
+        # story.updated_at(entry["Updated at"], type="datetime")
+        story.labels(entry["Labels"])
+        with story.notes(type="array") as notes:
+            for n in entry["Notes Full"]:
+                with notes.note() as note:
+                    note.text(n[0])
+                    note.noted_at(translate_time(n[1], quotes=False), type="datetime")
+                    # note.author(n[2]) # prevent valid membership check at PT end
+    return tree(pretty=True)
+
+
+def fetch_pt_project_membership(api_key, pt_project_id):
+    ''' Get the membership roster of the pt project and return the first member. '''
+    member_id = None
+    try:
+        r = requests.get(
+            PT_ENDPOINT.format(PROJECT_ID=pt_project_id)+"/memberships", headers={"X-TrackerToken": api_key}
+        )
+        # print r.text
+        dom = minidom.parseString(r.text)
+        members = dom.getElementsByTagName('membership')
+        #member_id = members[0].getElementsByTagName('id')[0].firstChild.wholeText if members else None
+        members[0].getElementsByTagName('person')[0].getElementsByTagName('name')[0].firstChild.wholeText
+    except:
+        pass
+    return member_id
+
+def call_pt_api(source, api_key, pt_project_id, requestor_id):
+    for entry in source:
+        payload = translate_story(entry, pt_project_id, requestor_id)
+        r = requests.post(
+            PT_ENDPOINT.format(PROJECT_ID=pt_project_id)+"/stories", 
+            headers={
+                "X-TrackerToken": api_key,
+                "Content-Type": "application/xml"
+            },
+            data=payload
+        )
+        print r
+        # print r.text
+        # print payload
 
 
 def main():
     """ run this thing
     """
-    db, target = getargs()
-    source = read_database(db)
-    write_csv(source, target)
-    print "\n\nDone!"
+    db, api_key, pt_project_id = sqlite3.connect(sys.argv[1]), sys.argv[2], sys.argv[3]
+    source = read_database(db, quotes=False)
+    requestor_id = fetch_pt_project_membership(api_key, pt_project_id)
+    call_pt_api(source, api_key, pt_project_id, requestor_id)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,11 @@ Known Bugs / Limitations
   very different routes. For example "wontfix" or "invalid" in Trac don't have
   a correspondent state in Pivotal Tracker.
 
+To Do
+-----
+
+ * support porting notes timestamps
+
 
 Installation
 ------------
